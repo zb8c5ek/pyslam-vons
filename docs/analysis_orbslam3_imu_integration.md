@@ -632,7 +632,30 @@ Where:
 
 The optimization variables are the **current frame's pose, velocity, and biases**. The last keyframe's state is fixed as a reference.
 
-### 7.4 Tracking State Machine with IMU
+### 7.4 Two Tracking Optimization Variants
+
+ORB-SLAM3 chooses between two optimization functions depending on whether the local mapper has processed a new keyframe:
+
+```cpp
+if (!mbMapUpdated)
+    Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame);
+else
+    Optimizer::PoseInertialOptimizationLastKeyFrame(&mCurrentFrame);
+```
+
+**`PoseInertialOptimizationLastKeyFrame`**: Anchors to the last keyframe (whose state was refined by local BA). Vertices: current frame (optimized) + last KF (fixed). Uses `EdgeInertial` from KF-to-frame preintegration.
+
+**`PoseInertialOptimizationLastFrame`**: Anchors to the previous frame (not a keyframe). Uses a **marginalized prior** `EdgePriorPoseImu` from the previous frame's accumulated Hessian:
+
+```cpp
+// The prior encodes all information from frames before the previous frame
+EdgePriorPoseImu* ep = new EdgePriorPoseImu(pPrevFrame->mpcpi);
+// mpcpi = ConstraintPoseImu containing the 15×15 marginalized Hessian
+```
+
+This implements **sliding-window marginalization**: information from all frames before the previous frame is compressed into a single prior constraint `ConstraintPoseImu`, avoiding the need to re-optimize over the entire history. The Hessian is symmetrized and has small eigenvalues clipped to zero for numerical stability.
+
+### 7.5 Tracking State Machine with IMU
 
 ```
                     ┌──────────────────┐
@@ -689,15 +712,31 @@ E_LBA = Σ_{(k,i)} ρ(||r_proj(X_k, T_i)||²_{Σ_proj})     (visual: reprojectio
       + Σ_{i} ||b_a^{i+1} - b_a^{i}||²_{Σ_ba}            (accel bias random walk)
 ```
 
-### 8.3 g2o Graph for Local Inertial BA
+### 8.3 Temporal Window Selection
+
+Unlike pure visual BA (which uses covisibility), `LocalInertialBA` uses a **temporal window** walking backward through the `mPrevKF` linked list:
+
+```cpp
+int maxOpt = 10;  // Normal: 10 KFs (25 if bLarge)
+const int Nd = min(numKFs - 2, maxOpt);
+
+vpOptimizableKFs.push_back(pKF);
+for (int i = 1; i < Nd; i++)
+    vpOptimizableKFs.push_back(vpOptimizableKFs.back()->mPrevKF);
+
+// The fixed frame is the one just before the temporal window
+lFixedKeyFrames.push_back(vpOptimizableKFs.back()->mPrevKF);
+```
+
+### 8.4 g2o Graph for Local Inertial BA
 
 ```
     Fixed KF        Local KFs (optimized)           Map Points
     ─────────       ────────────────────           ──────────
 
     [Pose_0]─fixed  [Pose_1]  [Pose_2]  [Pose_3]   [X_1] [X_2] [X_3] ...
-    [Vel_0] ─fixed  [Vel_1]   [Vel_2]   [Vel_3]
-    [Bg_0]  ─fixed  [Bg_1]    [Bg_2]    [Bg_3]
+    [Vel_0] ─fixed  [Vel_1]   [Vel_2]   [Vel_3]      (marginalized via
+    [Bg_0]  ─fixed  [Bg_1]    [Bg_2]    [Bg_3]       Schur complement)
     [Ba_0]  ─fixed  [Ba_1]    [Ba_2]    [Ba_3]
 
     Edges:
@@ -709,6 +748,17 @@ E_LBA = Σ_{(k,i)} ρ(||r_proj(X_k, T_i)||²_{Σ_proj})     (visual: reprojectio
     │   (penalizes large accel bias changes between keyframes)
     └── EdgeMono/Stereo: Pose_i → X_j (reprojection errors)
 ```
+
+**Boundary edge treatment**: The edge connecting the last optimizable KF to the fixed KF is downweighted to avoid accumulating errors from the fixed anchor:
+```cpp
+if (i == N-1 || bRecInit) {
+    vei[i]->setRobustKernel(new g2o::RobustKernelHuber);
+    if (i == N-1)
+        vei[i]->setInformation(vei[i]->information() * 1e-2);  // 100x downweight
+}
+```
+
+Map points are set as `marginalized=true`, enabling the Schur complement to eliminate them first and create a dense problem over only the pose/velocity/bias variables.
 
 ### 8.4 Key Differences from Pure Visual BA
 
@@ -731,32 +781,64 @@ IMU-guided poses are more accurate, which means:
 
 ## 9. How IMU Guides Loop Closing and Map Merging
 
-### 9.1 Loop Closing with IMU
+### 9.1 4-DOF Pose Graph Optimization (Key Insight)
 
-When a loop is detected between the current keyframe and a past keyframe:
+When a loop is detected in an **inertial map**, ORB-SLAM3 uses a special **4-DOF pose graph** instead of the standard 7-DOF (Sim3) or 6-DOF (SE3):
 
-1. **Sim(3) Computation**: In mono-inertial mode, the Sim(3) alignment includes scale. In stereo-inertial mode, scale is 1 (already metric).
+```cpp
+if (pLoopMap->IsInertial() && pLoopMap->isImuInitialized()) {
+    Optimizer::OptimizeEssentialGraph4DoF(pLoopMap, ...);
+}
+```
 
-2. **Pose Graph Optimization (PGO)**: The essential graph is optimized with Sim(3)/SE(3) constraints:
-   - Loop closure edge (from place recognition + geometric verification)
-   - Covisibility graph edges (strong connections between keyframes)
-   - **IMU does not directly participate in PGO** — the essential graph uses only geometric constraints
+**Rationale**: With an initialized IMU:
+- **Roll and pitch** are locked by the accelerometer (gravity is observable)
+- **Scale** is locked by the IMU dynamics (metric from preintegration)
+- Only **yaw rotation + 3D translation = 4 DOF** remain free per pose
 
-3. **Post-PGO BA**: After PGO corrects the trajectory, a full GBA is launched that includes IMU factors.
+The `VertexPose4DoF` enforces this constraint:
+```cpp
+void oplusImpl(const double* update_) {
+    double update6DoF[6];
+    update6DoF[0] = 0;            // No roll update
+    update6DoF[1] = 0;            // No pitch update
+    update6DoF[2] = update_[0];   // Yaw only
+    update6DoF[3] = update_[1];   // tx
+    update6DoF[4] = update_[2];   // ty
+    update6DoF[5] = update_[3];   // tz
+}
+```
 
-### 9.2 Map Merging with IMU
+The `Edge4DoF` information matrix enforces high weight on roll/pitch:
+```cpp
+matLambda(0,0) = 1e3;  // High weight on roll (constrained by IMU)
+matLambda(1,1) = 1e3;  // High weight on pitch (constrained by IMU)
+```
+
+This is a much more constrained optimization than the 7-DOF Sim(3) PGO used in visual-only mode, leading to faster convergence and more stable corrections.
+
+### 9.2 Post-Loop GBA
+
+After PGO, a full Global Bundle Adjustment is launched with IMU factors:
+```cpp
+if (!bImuInit)
+    Optimizer::GlobalBundleAdjustemnt(pActiveMap, ...);  // Visual only
+else
+    Optimizer::FullInertialBA(pActiveMap, 7, ...);       // Full VI-BA
+```
+
+### 9.3 Map Merging with IMU
 
 When the Atlas detects that two sub-maps overlap (via place recognition):
 
-1. **Alignment**: The relative SE(3) / Sim(3) transformation between maps is computed
-2. **Merging**: Map points and keyframes from the smaller map are transformed into the larger map's coordinate frame
-3. **Welding BA**: A local visual-inertial BA is run around the merge point to smooth the transition:
-   - This includes IMU preintegration factors between the now-connected keyframes
-   - Velocities and biases are re-estimated for consistency
+1. **Alignment**: The relative SE(3)/Sim(3) transformation between maps is computed
+2. **Merging**: Map points and keyframes from the smaller map are transformed into the larger map's frame
+3. **Welding BA**: `Optimizer::MergeInertialBA()` runs a joint optimization over the merged map including all IMU constraints from both sub-maps
+4. **Bias re-estimation**: `Optimizer::InertialOptimization()` re-estimates biases for the merged map
 
-### 9.3 Scale Correction
+### 9.4 Scale Correction
 
-In mono-inertial mode, scale drift can accumulate. Loop closure provides an opportunity to correct scale:
+In mono-inertial mode, scale drift can accumulate. Loop closure corrects scale:
 - The Sim(3) alignment between loop keyframes estimates a scale correction
 - This correction is propagated to all affected keyframes and map points
 - After PGO, the GBA with IMU factors further refines the global scale
