@@ -111,17 +111,27 @@ Key requirements:
 
 ### 3.2 IMU Buffering
 
-IMU measurements are buffered in a vector associated with each frame:
+IMU measurements arrive asynchronously (typically at 200-1000 Hz) and are pushed into a thread-safe queue:
 
 ```cpp
-// In System.cc - GrabImageMonocular / GrabImageStereo
-// IMU measurements are passed as: vector<IMU::Point> vImuMeas
-// Each IMU::Point contains: {acceleration(3), angular_velocity(3), timestamp}
+// In Tracking.cc
+void Tracking::GrabImuData(const IMU::Point &imuMeasurement) {
+    unique_lock<mutex> lock(mMutexImuQueue);
+    mlQueueImuData.push_back(imuMeasurement);
+}
+
+// Each IMU::Point contains:
+struct Point {
+    Eigen::Vector3f a;   // accelerometer reading (m/s^2)
+    Eigen::Vector3f w;   // gyroscope reading (rad/s)
+    double t;            // timestamp
+};
 ```
 
 When a new image arrives at timestamp `t_image`:
-1. All IMU measurements with timestamps between `t_last_image` and `t_image` are collected
-2. These measurements are stored in `mCurrentFrame.mvImuMeasurements`
+1. All IMU measurements with timestamps between `t_last_image` and `t_image` are extracted from `mlQueueImuData`
+2. Measurements older than the previous frame are discarded
+3. The boundary sample (at or after the current frame timestamp) is included
 
 ### 3.3 Temporal Integration Boundaries
 
@@ -139,14 +149,43 @@ Preintegration window:   |<-------- Δt_ij = t_j - t_i ------->|
 
 All IMU measurements with `t_i < t_imu ≤ t_j` are integrated into the preintegrated measurement `Δ_ij`.
 
-### 3.4 Interpolation at Frame Boundaries
+### 3.4 Trapezoidal Interpolation at Frame Boundaries
 
-ORB-SLAM3 does **not** interpolate IMU measurements at exact frame timestamps. Instead:
-- The first IMU measurement after the previous frame timestamp and the last IMU measurement before (or at) the current frame timestamp define the integration bounds
-- Each discrete IMU sample is integrated with `dt = t_imu[k+1] - t_imu[k]` for interior samples
-- The first and last intervals use the actual time differences to the frame boundaries
+ORB-SLAM3 **does** perform interpolation at frame boundaries using a trapezoidal scheme. In `PreintegrateIMU()`, four cases are handled:
 
-### 3.5 Common Timestamp Issues
+| Case | Condition | Behavior |
+|------|-----------|----------|
+| First & not last | `i==0 && i<n-1` | Interpolates acceleration/angular velocity at the previous frame's timestamp boundary |
+| Middle | `0<i<n-1` | Standard midpoint (trapezoidal) averaging between consecutive samples |
+| Last & not first | `i>0 && i==n-1` | Interpolates at the current frame's timestamp boundary |
+| Only one | `i==0 && i==n-1` | Uses single measurement directly |
+
+The boundary interpolation formula for the first sample:
+```cpp
+tab = t[i+1] - t[i];
+tini = t[i] - t_prev_frame;
+acc = 0.5f * (a[i] + a[i+1] - (a[i+1]-a[i]) * (tini/tab));  // trapezoidal interp
+```
+
+This ensures preintegration windows align exactly with frame timestamps rather than raw IMU sample timestamps.
+
+### 3.5 Dual Preintegration
+
+`PreintegrateIMU()` maintains **two** preintegration objects simultaneously:
+
+```cpp
+mpImuPreintegratedFromLastKF->IntegrateNewMeasurement(acc, angVel, tstep);
+pImuPreintegratedFromLastFrame->IntegrateNewMeasurement(acc, angVel, tstep);
+```
+
+| Object | From | To | Used For |
+|--------|------|----|----------|
+| `mpImuPreintegratedFromLastKF` | Last keyframe | Current frame | Optimization (local BA, loop closing) |
+| `mpImuPreintegratedFrame` | Last frame | Current frame | Frame-to-frame pose prediction |
+
+This allows the system to predict from the most recent optimized state (keyframe) when available, or from the last frame when the optimizer hasn't run yet.
+
+### 3.6 Common Timestamp Issues
 
 From the ORB-SLAM3 issue tracker, the most common failures are:
 - **"Frame with a timestamp older than previous frame detected!"** — Non-monotonic camera timestamps
@@ -380,56 +419,108 @@ IntegratedRotation::IntegratedRotation(const cv::Point3f &angVel, const float &d
 
 The initialization is ORB-SLAM3's **most novel contribution** for IMU integration. Unlike VINS-Mono (which uses a multi-step algebraic approach), ORB-SLAM3 uses a **MAP estimation** approach.
 
-### 6.1 Three-Stage Pipeline
+### 6.1 Three-Phase Pipeline with Progressive Prior Relaxation
+
+ORB-SLAM3's initialization uses **three progressive phases** with decreasing prior strength on biases, controlled by `priorG` (gyro prior) and `priorA` (accel prior):
 
 ```
-Stage 1: Vision-Only Map Building (2 seconds)
-├── Run pure visual SLAM at keyframe rate (~4 Hz)
-├── Build initial map with ~10 keyframes and hundreds of map points
-├── Perform visual-only bundle adjustment
-└── Result: up-to-scale trajectory {R_i, s·p_i} for each keyframe
+Phase 1: Initial Estimation (at ~2s)  [priorG=1e2, priorA=1e10]
+├── Requires ≥10 keyframes spanning >2s (mono) or >1s (stereo/RGBD)
+├── Estimate gravity direction from velocity preintegration:
+│   dirG = -Σ R_prev · ΔVelocity   (gravity emerges from velocity residuals)
+│   Rwg = rotation aligning z-axis with estimated gravity
+├── Run Optimizer::InertialOptimization with strong bias priors
+│   ├── VertexGDir (2 DOF): gravity direction on unit sphere
+│   ├── VertexScale (1 DOF): exponential parameterization (ensures s>0)
+│   ├── EdgeInertialGS: connects poses+vel+bias+gravity+scale
+│   └── Biases strongly constrained → essentially assumed zero
+├── Scale map: p_i → s · p_i, X_j → s · X_j
+├── Rotate world frame: z-axis aligned with gravity
+└── Result: coarse metric scale, gravity direction
 
           ↓
 
-Stage 2: Inertial-Only MAP Estimation
-├── Input: visual trajectory (as prior) + IMU preintegrations between keyframes
-├── Estimate: scale (s), gravity direction (g), velocities (v_i), biases (b_g, b_a)
-├── Method: solve inertial-only optimization (Optimizer::InertialOptimization)
-│   ├── Fix visual poses as priors
-│   ├── Add IMU preintegration factors between consecutive keyframes
-│   ├── Optimize over: s, g (2 DOF on S²), {v_i}, b_g, b_a
-│   └── Gravity is parameterized with 2 DOF (direction on unit sphere)
-└── Result: metric scale, gravity direction, initial velocities and biases
+Phase 2: VIBA 1 (at ~5s)  [priorG=1.0, priorA=1e5]
+├── Relaxes gyro bias prior (now free to move)
+├── Still constrains accelerometer bias (harder to estimate)
+├── Runs full visual-inertial BA (FullInertialBA)
+└── Result: refined scale, biases beginning to converge
 
           ↓
 
-Stage 3: Joint Visual-Inertial Refinement
-├── Scale all positions: p_i → s · p_i
-├── Rotate world frame: align z-axis with gravity direction
-├── Scale all map points: X_j → s · X_j
-├── Perform joint visual-inertial BA (all variables free)
-└── Result: fully initialized visual-inertial SLAM
+Phase 3: VIBA 2 (at ~15s)  [priorG=0.0, priorA=0.0]
+├── Removes ALL bias priors → fully observable system
+├── Runs full visual-inertial BA
+└── Result: fully initialized, biases converged
+
+          ↓
+
+Periodic Scale Refinement (at 25s, 35s, 45s, 55s, 65s, 75s)
+└── Runs InertialOptimization for scale+gravity only (ScaleRefinement)
 ```
 
-### 6.2 Inertial-Only Optimization (Stage 2) — Detail
+### 6.2 Gravity Direction Estimation (from source code)
 
-The inertial-only cost function minimizes:
+The initial gravity direction is estimated from the velocity preintegration residuals. The key insight: the preintegrated velocity change between keyframes includes a gravity term `R_k · g · dt`. By summing `R_k^T · ΔV` across many keyframes, the gravity direction emerges:
+
+```cpp
+// In LocalMapping::InitializeIMU()
+for each keyframe pair (prev, curr):
+    dirG -= R_prev * pInt->GetDeltaVelocity();   // Accumulate gravity-induced velocity
+    velocity = (p_curr - p_prev) / dt;            // Initial velocity estimate
+
+// Compute rotation from visual frame to gravity-aligned frame
+dirG = dirG / |dirG|;                  // normalize
+gI = [0, 0, -1];                      // canonical gravity direction
+v = gI.cross(dirG);                   // rotation axis
+ang = acos(gI.dot(dirG));             // rotation angle
+Rwg = Exp(v * ang / |v|);             // gravity-to-world rotation
+```
+
+### 6.3 Inertial-Only Optimization — Detail
+
+This uses the special `EdgeInertialGS` edge that includes gravity direction and scale as optimizable vertices:
 
 ```
-E_inertial = Σ_i ||r_I(x_i, x_{i+1})||² + ||r_prior||²
+Graph for InertialOptimization:
+
+For each consecutive keyframe pair (KF_i, KF_{i+1}):
+    EdgeInertialGS connects 8 vertices:
+        [0] VP_i      (pose i — fixed from visual SLAM)
+        [1] VV_i      (velocity i — optimized)
+        [2] VG         (gyro bias — shared, optimized)
+        [3] VA         (accel bias — shared, optimized)
+        [4] VP_{i+1}  (pose i+1 — fixed)
+        [5] VV_{i+1}  (velocity i+1 — optimized)
+        [6] VertexGDir (2 DOF gravity direction — optimized)
+        [7] VertexScale (1 DOF metric scale — optimized)
 ```
 
-Where the **inertial residual** `r_I` between consecutive keyframes `i` and `i+1` uses the preintegrated measurements to constrain:
-- The relative rotation must match `ΔR_ij`
-- The relative velocity must match `Δv_ij` (accounting for gravity)
-- The relative position must match `Δp_ij` (accounting for gravity and velocity)
+The `VertexGDir` stores a rotation `Rwg` and uses only 2 DOF (pitch and roll):
+```cpp
+class GDirection {
+    Eigen::Matrix3d Rwg;
+    void Update(const double *pu) {
+        Rwg = Rwg * ExpSO3(pu[0], pu[1], 0.0);
+        // Only 2 DOF: yaw around gravity is unobservable from accelerometer
+    }
+};
+```
 
-The unknowns are:
-- **Scale factor** `s` — applied to all monocular positions
-- **Gravity direction** `g/||g||` — parameterized as 2 DOF on S²
-- **Velocities** `{v_i}` — one per keyframe (3 DOF each)
-- **Gyroscope bias** `b_g` — assumed constant during initialization window (3 DOF)
-- **Accelerometer bias** `b_a` — assumed constant during initialization window (3 DOF)
+The `VertexScale` uses exponential parameterization to enforce positivity:
+```cpp
+class VertexScale : public g2o::BaseVertex<1, double> {
+    void oplusImpl(const double *update_) {
+        setEstimate(estimate() * exp(*update_));  // s_new = s * exp(δ) > 0
+    }
+};
+```
+
+In `EdgeInertialGS`, the gravity vector and position terms become:
+```
+g = scale * Rwg * gI            (gravity in world frame, scaled)
+p = scale * p_visual            (positions scaled by metric scale factor)
+```
 
 ### 6.3 Convergence Characteristics
 
@@ -487,6 +578,18 @@ void Tracking::PredictStateIMU()
     // Set predicted pose on current frame
     mCurrentFrame.SetImuPoseVelocity(Rwb_predicted, twb_predicted, Vwb_predicted);
 }
+```
+
+`PredictStateIMU` has **two modes** based on whether the local mapper has updated the map:
+
+```cpp
+// Mode 1: Predict from last KEYFRAME (when map was updated by local mapper)
+Rwb2 = NormalizeRotation(Rwb_KF * pIMU_KF->GetUpdatedDeltaRotation());
+twb2 = twb_KF + Vwb_KF*t12 + 0.5f*t12*t12*Gz + Rwb_KF*pIMU_KF->GetUpdatedDeltaPosition();
+Vwb2 = Vwb_KF + t12*Gz + Rwb_KF*pIMU_KF->GetUpdatedDeltaVelocity();
+
+// Mode 2: Predict from last FRAME (when map was not updated)
+// Same equations but using mLastFrame state and frame-to-frame preintegration
 ```
 
 This prediction is **significantly better** than the constant velocity model because:
@@ -938,7 +1041,27 @@ The remaining 6×6 block (for biases) feeds into the `EdgeGyroRW` and `EdgeAccRW
 
 ---
 
-## 13. References
+## 13. Design Insights and Architecture Notes
+
+1. **Thread safety**: The `Preintegrated` class uses `std::mutex` on all getters because the tracking thread reads preintegrated values while the local mapping thread may update biases.
+
+2. **Dual preintegration**: Maintaining both keyframe-to-current and frame-to-frame preintegration allows the system to predict from the most recent optimized state (keyframe) when available, or from the last frame when the optimizer hasn't run yet.
+
+3. **Progressive initialization**: The three-phase initialization with decreasing prior strength (`priorG`: 1e2 → 1.0 → 0.0; `priorA`: 1e10 → 1e5 → 0.0) is crucial for robustness. Initially, biases are strongly constrained (essentially zero), then gradually freed as more data accumulates and the system becomes observable.
+
+4. **Body frame convention**: All preintegration is done in the body (IMU) frame. The `Calib::mTbc` and `Calib::mTcb` transforms convert between camera and body frames. The `EdgeInertial` error is computed in the body frame of keyframe `i` to avoid the influence of unobservable states (yaw + absolute position).
+
+5. **SVD normalization**: `NormalizeRotation()` uses SVD to project potentially drifted rotation matrices back onto SO(3), preventing numerical drift during long integration sequences.
+
+6. **Scale observability**: In monocular mode, the `VertexScale` with exponential parameterization (`s * exp(δ)`) is essential because metric scale is unobservable from vision alone but becomes observable with IMU integration. Once determined, the map is rescaled and subsequent optimization works in metric coordinates.
+
+7. **Stored raw measurements**: The `Preintegrated` class stores all raw IMU samples in `mvMeasurements`. This enables `Reintegrate()` when biases change significantly (beyond the first-order correction range), and `MergePrevious()` when keyframes are culled and preintegration windows must be combined.
+
+8. **Update order in integration**: The deliberate order (position → velocity → rotation) in `IntegrateNewMeasurement` is essential because each depends on the previous value of the others. Computing position before updating velocity/rotation ensures consistency with the discrete-time integration scheme.
+
+---
+
+## 14. References
 
 - Campos, C., Elvira, R., Rodriguez, J.J.G., Montiel, J.M.M., Tardos, J.D. "ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map SLAM." IEEE T-RO, 2021. [arXiv:2007.11898](https://arxiv.org/abs/2007.11898)
 - Forster, C., Carlone, L., Dellaert, F., Scaramuzza, D. "On-Manifold Preintegration for Real-Time Visual-Inertial Odometry." IEEE T-RO, 2017. [arXiv:1512.02363](https://arxiv.org/abs/1512.02363)
